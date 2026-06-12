@@ -1,0 +1,3 @@
+anthropic
+faster-whisper
+yt-dlp
