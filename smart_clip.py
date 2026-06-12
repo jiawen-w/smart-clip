@@ -139,6 +139,20 @@ CONDENSE_PROMPT = """你是短视频剪辑师。下面是一段长视频片段�
 只输出 JSON：
 {{"segments": [{{"start_sec": 数字, "end_sec": 数字, "why": "选这段的理由"}}], "summary": "成片内容概述"}}"""
 
+PACKAGE_PROMPT = """你是抖音爆款视频包装师。短视频主题：{TOPIC}
+
+成片字幕逐行如下（带行号）：
+{LINES}
+
+任务：
+1. 起一个爆款标题，放在竖屏顶部，最多两行、每行不超过 10 个字。
+   要有钩子：悬念/数字/反差/利益点（参考风格：「FBI教我的3个字」「同事都以为我会读心术」）
+2. 为每行字幕挑 0-1 个最值得高亮的关键词（必须是该行原文里连续出现的字词，金句/数字/转折词优先）
+
+只输出 JSON：
+{{"title": ["第一行", "第二行"], "highlights": {{"0": "关键词", "3": "关键词"}}}}
+highlights 的 key 是字幕行号（字符串），没有值得高亮的行就不要出现。"""
+
 COVER_SCORE_PROMPT = """你在为短视频挑封面，要求：{COVER_DESC}
 
 下面 {N} 张候选帧，时间戳依次是：{TIMESTAMPS}
@@ -463,6 +477,108 @@ def cut_multi(video, segments, out_path):
     print(f"  ✅ 成片：{out_path}")
 
 
+def remap_subtitles(transcript, pieces):
+    """成片由原片若干区间拼成，把原片字幕时间轴换算到成片时间轴"""
+    subs, offset = [], 0.0
+    for p in pieces:
+        ps, pe = float(p["start_sec"]), float(p["end_sec"])
+        for seg in transcript:
+            if seg["end"] <= ps or seg["start"] >= pe:
+                continue
+            subs.append({"start": max(seg["start"], ps) - ps + offset,
+                         "end": min(seg["end"], pe) - ps + offset,
+                         "text": seg["text"]})
+        offset += pe - ps
+    return subs
+
+
+def split_subtitle(text, limit=15):
+    """长句拆成多屏短字幕（一屏一行大字才有抖音味）"""
+    text = re.sub(r"[，。！？、；,.!?;]+$", "", text)
+    if len(text) <= limit:
+        return [text]
+    parts = re.split(r"[，。！？、；,.!?;]", text)
+    parts = [p for p in parts if p]
+    out = []
+    for p in parts:
+        while len(p) > limit:
+            out.append(p[:limit])
+            p = p[limit:]
+        out.append(p)
+    return out
+
+
+def ass_time(sec):
+    cs = int(round(max(sec, 0) * 100))
+    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+
+def build_ass(display, title_lines, highlights, total_end):
+    """生成 ASS 字幕：顶部爆款标题 + 底部大字幕 + 关键词高亮（抖音黄）"""
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Title,PingFang SC,88,&H0000E6FF,&H00FFFFFF,&H00000000,&H7F000000,1,0,0,0,100,100,2,0,1,5,2,8,60,60,170,1
+Style: Sub,PingFang SC,68,&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,1,0,0,0,100,100,1,0,1,4,2,2,60,60,380,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+    if title_lines:
+        t = "\\N".join(title_lines)
+        events.append(f"Dialogue: 0,{ass_time(0)},{ass_time(total_end)},Title,,0,0,0,,{t}")
+    for i, d in enumerate(display):
+        text = d["text"].replace("{", "").replace("}", "")
+        kw = highlights.get(i)
+        if kw and kw in text:
+            text = text.replace(kw, r"{\c&H0000E6FF&}" + kw + r"{\c&HFFFFFF&}", 1)
+        events.append(f"Dialogue: 0,{ass_time(d['start'])},{ass_time(d['end'])},Sub,,0,0,0,,{text}")
+    return header + "\n".join(events) + "\n"
+
+
+def package_for_douyin(client, clip, subs, topic, out_path):
+    """抖音包装：竖屏 1080x1920（模糊背景填充）+ 爆款标题 + 大字幕高亮 + 响度标准化"""
+    # 长句拆屏，时间按字数比例分摊
+    display = []
+    for s in subs:
+        parts = split_subtitle(s["text"])
+        total_chars = sum(len(p) for p in parts) or 1
+        t = s["start"]
+        for p in parts:
+            dur = (s["end"] - s["start"]) * len(p) / total_chars
+            display.append({"start": t, "end": t + dur, "text": p})
+            t += dur
+    lines = "\n".join(f"{i}. {d['text']}" for i, d in enumerate(display))
+    style = parse_json_block(ai_text(client, PACKAGE_PROMPT.format(
+        TOPIC=topic or "精华短视频", LINES=lines), model=AI_MODEL))
+    title_lines = [t.strip() for t in style.get("title", []) if t.strip()][:2]
+    highlights = {int(k): v for k, v in style.get("highlights", {}).items()}
+    print(f"  爆款标题：{' / '.join(title_lines)}")
+    print(f"  高亮关键词 {len(highlights)} 处，字幕 {len(display)} 屏")
+
+    work = out_path.parent / "_package"
+    work.mkdir(exist_ok=True)
+    total_end = max(d["end"] for d in display) + 5
+    (work / "subs.ass").write_text(build_ass(display, title_lines, highlights, total_end))
+    fc = (
+        "[0:v]split[a][b];"
+        "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,gblur=sigma=30,eq=brightness=-0.08[bg];"
+        "[b]scale=1080:-2[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subs.ass[v];"
+        "[0:a]loudnorm=I=-16:TP=-1.5[aud]"
+    )
+    run_cmd(["ffmpeg", "-y", "-i", str(clip), "-filter_complex", fc,
+             "-map", "[v]", "-map", "[aud]", "-c:v", "libx264", "-preset", "fast",
+             "-crf", "18", "-c:a", "aac", "-b:a", "192k", str(out_path)], cwd=work)
+    print(f"  ✅ 抖音成片：{out_path}")
+
+
 def pick_cover(client, video, start, end, cover_desc, frames_dir, out_dir):
     """密集抽帧 → 打分初选 → 终选给理由 → 导出原分辨率封面"""
     step = max((end - start) / 40, 2)
@@ -529,7 +645,7 @@ def insert_pip(client, main_video, pip_video, at_sec, out_path):
 # 主流程
 # ============================================================
 def run(video, task=None, cover=None, cut=None, duration=None, pip=None,
-        pip_at="0", transcribe=True, whisper_model="medium"):
+        pip_at="0", transcribe=True, whisper_model="medium", package=True):
     if re.match(r"https?://", str(video)):
         print(f"\n[0/5] 下载视频")
         video = download_video(str(video), OUTPUT_ROOT / "downloads")
@@ -572,7 +688,7 @@ def run(video, task=None, cover=None, cut=None, duration=None, pip=None,
         start, end = locate_segment(client, video, total_dur, task, frames_dir, transcript)
         start, end = refine_boundaries(client, task, start, end, transcript)
 
-    clip_path = None
+    clip_path = pieces = None
     if start is not None:
         print(f"\n[4/5] 剪切片段")
         min_sec = max_sec = None
@@ -586,14 +702,26 @@ def run(video, task=None, cover=None, cut=None, duration=None, pip=None,
                                              transcript, min_sec, max_sec)
                 clip_path = out_dir / f"short_{format_timestamp(start).replace(':', '')}.mp4"
                 cut_multi(video, segments, clip_path)
+                pieces = segments
             else:
                 print(f"  ⚠️ 没有转录稿无法挑精华，直接截取前 {int(max_sec)} 秒"
                       f"（去掉 --no-transcribe 可启用 AI 精选）")
                 clip_path = out_dir / f"clip_{format_timestamp(start).replace(':', '')}.mp4"
                 cut_clip(video, start, start + max_sec, clip_path)
+                pieces = [{"start_sec": start, "end_sec": start + max_sec}]
         else:
             clip_path = out_dir / f"clip_{format_timestamp(start).replace(':', '')}.mp4"
             cut_clip(video, start, end, clip_path)
+            pieces = [{"start_sec": start, "end_sec": end}]
+
+    if package and clip_path and pieces and transcript:
+        print(f"\n[包装] 抖音竖屏包装")
+        subs = remap_subtitles(transcript, pieces)
+        if subs:
+            package_for_douyin(client, clip_path, subs, task,
+                               out_dir / f"douyin_{clip_path.stem}.mp4")
+        else:
+            print("  ⚠️ 成片区间没有字幕内容，跳过包装")
 
     if cover:
         print(f"\n[5/5] 挑选封面")
@@ -620,6 +748,8 @@ if __name__ == "__main__":
     ap.add_argument("--pip-at", default="0", help="画中画插入时间点，默认开头")
     ap.add_argument("--no-transcribe", action="store_true", help="跳过音频转录（只靠画面定位）")
     ap.add_argument("--whisper-model", default="medium", help="whisper 模型：small/medium/large")
+    ap.add_argument("--no-package", action="store_true",
+                    help="跳过抖音包装（竖屏+标题+字幕），只出原比例成片")
     args = ap.parse_args()
     if not args.video:
         print("🎬 AI 视频剪辑助手（全自动模式：自己选内容、剪 1-3 分钟短视频、配封面）")
@@ -631,4 +761,5 @@ if __name__ == "__main__":
             args.task = extra
     run(args.video, task=args.task, cover=args.cover, cut=args.cut,
         duration=args.duration, pip=args.pip, pip_at=args.pip_at,
-        transcribe=not args.no_transcribe, whisper_model=args.whisper_model)
+        transcribe=not args.no_transcribe, whisper_model=args.whisper_model,
+        package=not args.no_package)
