@@ -247,11 +247,14 @@ def download_video(url, out_dir):
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "playlist_items": "1",  # B站多P视频只取第一P
     }
     if "bilibili.com" in url or "b23.tv" in url:
         ydl_opts["cookiesfrombrowser"] = ("chrome",)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = list(info["entries"])[0]
         path = Path(ydl.prepare_filename(info))
         if not path.exists():  # 合并后实际扩展名是 mp4
             path = path.with_suffix(".mp4")
@@ -646,9 +649,13 @@ def insert_pip(client, main_video, pip_video, at_sec, out_path):
 # ============================================================
 def run(video, task=None, cover=None, cut=None, duration=None, pip=None,
         pip_at="0", transcribe=True, whisper_model="medium", package=True):
-    if re.match(r"https?://", str(video)):
+    video = str(video).strip().strip("'\"")
+    if not re.match(r"https?://", video) and re.match(
+            r"(www\.)?(bilibili\.com|b23\.tv|youtube\.com|youtu\.be)/", video):
+        video = "https://" + video  # 用户常少贴 https:// 前缀
+    if re.match(r"https?://", video):
         print(f"\n[0/5] 下载视频")
-        video = download_video(str(video), OUTPUT_ROOT / "downloads")
+        video = download_video(video, OUTPUT_ROOT / "downloads")
     else:
         video = Path(video).expanduser()
     if not video.exists():
